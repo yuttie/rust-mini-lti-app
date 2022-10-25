@@ -1,10 +1,12 @@
 use axum::{
-    extract::Form,
-    response::IntoResponse,
+    body::Body,
+    extract::OriginalUri,
+    http::{header, request::Parts, Request, Uri},
     routing::{get, post},
     Router,
 };
-use serde::Deserialize;
+use hmac::{Hmac, Mac};
+use sha1::Sha1;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -34,48 +36,83 @@ async fn main() {
         .unwrap();
 }
 
-#[derive(Debug, Deserialize)]
-struct LtiPayload {
-    oauth_version: String,
-    oauth_nonce: String,
-    oauth_timestamp: String,
-    oauth_consumer_key: String,
-    user_id: String,
-    lis_person_sourcedid: String,
-    roles: String,
-    context_id: String,
-    context_label: String,
-    context_title: String,
-    resource_link_title: String,
-    resource_link_description: String,
-    resource_link_id: String,
-    context_type: String,
-    lis_course_section_sourcedid: String,
-    lis_result_sourcedid: String,
-    lis_outcome_service_url: String,
-    lis_person_name_given: String,
-    lis_person_name_family: String,
-    lis_person_name_full: String,
-    ext_user_username: String,
-    lis_person_contact_email_primary: String,
-    launch_presentation_locale: String,
-    ext_lms: String,
-    tool_consumer_info_product_family_code: String,
-    tool_consumer_info_version: String,
-    oauth_callback: String,
-    lti_version: String,
-    lti_message_type: String,
-    tool_consumer_instance_guid: String,
-    tool_consumer_instance_name: String,
-    tool_consumer_instance_description: String,
-    launch_presentation_document_target: String,
-    launch_presentation_return_url: String,
-    oauth_signature_method: String,
-    oauth_signature: String,
+async fn lti(OriginalUri(original_uri): OriginalUri, req: Request<Body>) -> String {
+    let (parts, body) = req.into_parts();
+    let body = String::from_utf8(hyper::body::to_bytes(body).await.unwrap().into()).unwrap();
+    tracing::debug!("{:?}", parts);
+    let opt_kvs = verify(original_uri, parts, body);
+    tracing::debug!("{:?}", opt_kvs);
+    format!("{:?}", opt_kvs)
 }
 
-async fn lti(Form(payload): Form<LtiPayload>) -> impl IntoResponse {
-    tracing::debug!("/lti accessed");
-    tracing::debug!("{:?}", payload);
-    "LTI"
+fn verify(original_uri: Uri, parts: Parts, body: String) -> Option<Vec<(String, String)>> {
+    // Method
+    let method = parts.method.as_str();
+    tracing::debug!("{:?}", method);
+    // URL
+    let url = Uri::builder()
+        .scheme(parts.headers.get("X-Forwarded-Proto").map(|v| v.to_str().unwrap()).unwrap_or("http"))
+        .authority(parts.headers[header::HOST].to_str().unwrap())
+        .path_and_query(original_uri.into_parts().path_and_query.unwrap())
+        .build()
+        .unwrap()
+        .to_string();
+    tracing::debug!("{:?}", url);
+    // Params
+    let mut kvs: Vec<(String, String)> = body
+        .split('&')
+        .map(|kv| {
+            let mut split = kv.split('=');
+            let key = split.next().unwrap().replace("+", "%20");
+            let value = split.next().unwrap().replace("+", "%20");
+            let decoded_key = urlencoding::decode(&key).unwrap().into_owned();
+            let decoded_value = urlencoding::decode(&value).unwrap().into_owned();
+            (decoded_key, decoded_value)
+        })
+        .collect();
+    kvs.sort();
+    let params = kvs
+        .iter()
+        .filter(|(key, _)| {
+            key != "oauth_signature"
+        })
+        .map(|(key, value)| {
+            // Encode key and value to conform OAuth 1.0's percent encoding
+            // See https://www.rfc-editor.org/rfc/rfc5849#section-3.6
+            let encoded_key = urlencoding::encode(&key);
+            let encoded_value = urlencoding::encode(&value);
+            format!("{}={}", encoded_key, encoded_value)
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    tracing::debug!("{:?}", kvs);
+    tracing::debug!("{:?}", params);
+    // Base string
+    let base_str = format!("{}&{}&{}",
+        urlencoding::encode(method),
+        urlencoding::encode(&url),
+        urlencoding::encode(&params),
+    );
+    tracing::debug!("{:?}", base_str);
+    // Signature key
+    let signature_key = format!("{}&{}", "this_is_a_secret", "");
+    tracing::debug!("{:?}", signature_key);
+    // Generate HMAC-SHA1 signature
+    type HmacSha1 = Hmac<Sha1>;
+    let mut mac = HmacSha1::new_from_slice(signature_key.as_bytes()).unwrap();
+    mac.update(base_str.as_bytes());
+    let result = mac.finalize();
+    let signature = base64::encode(result.into_bytes());
+    tracing::debug!("{:?}", signature);
+    // Check equality
+    let i = kvs.binary_search_by_key(&"oauth_signature", |(k, _)| k.as_str()).unwrap();
+    let given_signature = kvs[i].1.as_str();
+    tracing::debug!("{:?}", given_signature);
+    tracing::debug!("{:?}", signature == given_signature);
+    if signature == given_signature {
+        Some(kvs)
+    }
+    else {
+        None
+    }
 }
