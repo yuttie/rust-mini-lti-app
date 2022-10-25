@@ -1,10 +1,14 @@
+use std::collections::HashMap;
+
 use axum::{
     body::Body,
+    Extension,
     extract::OriginalUri,
-    http::{header, request::Parts, Request, Uri},
+    http::{header, request::Parts, Request, StatusCode, Uri},
     routing::{get, post},
     Router,
 };
+use axum_extra::extract::cookie::{SignedCookieJar, Cookie, Key};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use tower_http::trace::TraceLayer;
@@ -17,9 +21,12 @@ async fn main() {
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    let key = Key::generate();
+
     let app = Router::new()
-        .route("/", get(|| async { "Hello, World!" }))
+        .route("/", get(index))
         .route("/lti", post(lti))
+        .layer(Extension(key))
         .layer(TraceLayer::new_for_http());
 
     let app_path = std::env::var("APP_PATH").unwrap_or("/".into());
@@ -36,13 +43,47 @@ async fn main() {
         .unwrap();
 }
 
-async fn lti(OriginalUri(original_uri): OriginalUri, req: Request<Body>) -> String {
+async fn index(jar: SignedCookieJar) -> Result<(SignedCookieJar, String), StatusCode> {
+    match (jar.get("name"), jar.get("count")) {
+        (Some(name), Some(count)) => {
+            let name = name.value().to_owned();
+            let count = count.value().parse::<usize>().unwrap();
+            let jar = jar
+                .add(Cookie::new("count", format!("{}", count + 1)));
+            let body = format!("Hello, {}.  You visited this page {} times.", name, count + 1);
+            Ok((
+                jar,
+                body,
+            ))
+        },
+        _ => {
+            Err(StatusCode::UNAUTHORIZED)
+        },
+    }
+}
+
+async fn lti(jar: SignedCookieJar, OriginalUri(original_uri): OriginalUri, req: Request<Body>) -> Result<(SignedCookieJar, String), StatusCode> {
     let (parts, body) = req.into_parts();
     let body = String::from_utf8(hyper::body::to_bytes(body).await.unwrap().into()).unwrap();
     tracing::debug!("{:?}", parts);
-    let opt_kvs = verify(original_uri, parts, body);
-    tracing::debug!("{:?}", opt_kvs);
-    format!("{:?}", opt_kvs)
+    let opt_params = verify(original_uri, parts, body);
+    tracing::debug!("{:?}", opt_params);
+    match opt_params {
+        Some(params) => {
+            let params = params.into_iter().collect::<HashMap<_, _>>();
+            let jar = jar
+                .add(Cookie::new("name", params["lis_person_name_full"].to_owned()))
+                .add(Cookie::new("count", "0"));
+            let body = format!("{:?}", jar);
+            Ok((
+                jar,
+                body,
+            ))
+        },
+        None => {
+            Err(StatusCode::UNAUTHORIZED)
+        },
+    }
 }
 
 fn verify(original_uri: Uri, parts: Parts, body: String) -> Option<Vec<(String, String)>> {
