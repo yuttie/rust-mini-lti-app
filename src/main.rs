@@ -97,22 +97,16 @@ fn verify(original_uri: Uri, parts: Parts, body: String) -> Option<Vec<(String, 
     // Signature key
     let signature_key = format!("{}&{}", "this_is_a_secret", "");
     tracing::debug!("{:?}", signature_key);
-    // Generate HMAC-SHA1 signature
+    // Find the code from a given signature
+    let i = kvs.binary_search_by_key(&"oauth_signature", |(k, _)| k.as_str()).unwrap();
+    let given_signature = kvs[i].1.as_str();
+    let given_code = base64::decode(given_signature).unwrap();
+    // Verify HMAC-SHA1 code
     type HmacSha1 = Hmac<Sha1>;
     let mut mac = HmacSha1::new_from_slice(signature_key.as_bytes()).unwrap();
     mac.update(base_str.as_bytes());
-    let result = mac.finalize();
-    let signature = base64::encode(result.into_bytes());
-    tracing::debug!("{:?}", signature);
-    // Check equality
-    let i = kvs.binary_search_by_key(&"oauth_signature", |(k, _)| k.as_str()).unwrap();
-    let given_signature = kvs[i].1.as_str();
-    tracing::debug!("{:?}", given_signature);
-    tracing::debug!("{:?}", signature == given_signature);
-    if signature == given_signature {
-        Some(kvs)
-    }
-    else {
-        None
+    match mac.verify_slice(&given_code[..]) {
+        Ok(_) => Some(kvs),
+        _ => None,
     }
 }
