@@ -100,17 +100,7 @@ fn verify(original_uri: Uri, parts: Parts, body: String) -> Option<Vec<(String, 
         .to_string();
     tracing::debug!("{:?}", url);
     // Params
-    let mut kvs: Vec<(String, String)> = body
-        .split('&')
-        .map(|kv| {
-            let mut split = kv.split('=');
-            let key = split.next().unwrap().replace("+", "%20");
-            let value = split.next().unwrap().replace("+", "%20");
-            let decoded_key = urlencoding::decode(&key).unwrap().into_owned();
-            let decoded_value = urlencoding::decode(&value).unwrap().into_owned();
-            (decoded_key, decoded_value)
-        })
-        .collect();
+    let mut kvs: Vec<(String, String)> = form_urlencoded::parse(body.as_bytes()).into_owned().collect();
     kvs.sort();
     let params = kvs
         .iter()
