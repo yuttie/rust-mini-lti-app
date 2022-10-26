@@ -10,6 +10,7 @@ use axum::{
 };
 use axum_extra::extract::cookie::{SignedCookieJar, Cookie, Key};
 use hmac::{Hmac, Mac};
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use sha1::Sha1;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -87,6 +88,9 @@ async fn lti(jar: SignedCookieJar, OriginalUri(original_uri): OriginalUri, req: 
 }
 
 fn verify(original_uri: Uri, parts: Parts, body: String) -> Option<Vec<(String, String)>> {
+    // Characters not in the unreserved character set defined in https://www.rfc-editor.org/rfc/rfc5849#section-3.6
+    const NON_UNRESERVED_CHARACTER_SET: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');
+
     // Method
     let method = parts.method.as_str();
     tracing::debug!("{:?}", method);
@@ -108,10 +112,8 @@ fn verify(original_uri: Uri, parts: Parts, body: String) -> Option<Vec<(String, 
             key != "oauth_signature"
         })
         .map(|(key, value)| {
-            // Encode key and value to conform OAuth 1.0's percent encoding
-            // See https://www.rfc-editor.org/rfc/rfc5849#section-3.6
-            let encoded_key = urlencoding::encode(&key);
-            let encoded_value = urlencoding::encode(&value);
+            let encoded_key = utf8_percent_encode(&key, NON_UNRESERVED_CHARACTER_SET);
+            let encoded_value = utf8_percent_encode(&value, NON_UNRESERVED_CHARACTER_SET);
             format!("{}={}", encoded_key, encoded_value)
         })
         .collect::<Vec<_>>()
@@ -120,9 +122,9 @@ fn verify(original_uri: Uri, parts: Parts, body: String) -> Option<Vec<(String, 
     tracing::debug!("{:?}", params);
     // Base string
     let base_str = format!("{}&{}&{}",
-        urlencoding::encode(method),
-        urlencoding::encode(&url),
-        urlencoding::encode(&params),
+        utf8_percent_encode(method, NON_UNRESERVED_CHARACTER_SET),
+        utf8_percent_encode(&url, NON_UNRESERVED_CHARACTER_SET),
+        utf8_percent_encode(&params, NON_UNRESERVED_CHARACTER_SET),
     );
     tracing::debug!("{:?}", base_str);
     // Signature key
