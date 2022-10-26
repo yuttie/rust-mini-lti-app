@@ -65,7 +65,7 @@ async fn index(jar: SignedCookieJar) -> Result<(SignedCookieJar, String), Status
 
 async fn lti(jar: SignedCookieJar, OriginalUri(original_uri): OriginalUri, req: Request<Body>) -> Result<(SignedCookieJar, String), StatusCode> {
     let (parts, body) = req.into_parts();
-    let body = String::from_utf8(hyper::body::to_bytes(body).await.unwrap().into()).unwrap();
+    let body = hyper::body::to_bytes(body).await.unwrap();
 
     // Method
     let method = parts.method;
@@ -81,7 +81,7 @@ async fn lti(jar: SignedCookieJar, OriginalUri(original_uri): OriginalUri, req: 
     tracing::debug!("{:?}", url);
 
     // Params
-    let mut params: Vec<(String, String)> = form_urlencoded::parse(body.as_bytes()).into_owned().collect();
+    let mut params: Vec<(String, String)> = form_urlencoded::parse(&body).into_owned().collect();
     params.sort();
     tracing::debug!("{:?}", params);
 
