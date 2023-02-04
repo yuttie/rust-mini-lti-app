@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::{
     body::Body,
@@ -24,10 +26,13 @@ async fn main() {
 
     let key = Key::generate();
 
+    let used_nonce_values: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+
     let app = Router::new()
         .route("/", get(index))
         .route("/lti", post(lti))
         .layer(Extension(key))
+        .layer(Extension(used_nonce_values))
         .layer(TraceLayer::new_for_http());
 
     let app_path = std::env::var("APP_PATH").unwrap_or("/".into());
@@ -63,7 +68,12 @@ async fn index(jar: SignedCookieJar) -> Result<(SignedCookieJar, String), Status
     }
 }
 
-async fn lti(jar: SignedCookieJar, OriginalUri(original_uri): OriginalUri, req: Request<Body>) -> Result<(SignedCookieJar, String), StatusCode> {
+async fn lti(
+    jar: SignedCookieJar,
+    OriginalUri(original_uri): OriginalUri,
+    Extension(used_nonce_values): Extension<Arc<Mutex<HashMap<String, Instant>>>>,
+    req: Request<Body>,
+) -> Result<(SignedCookieJar, String), StatusCode> {
     let (parts, body) = req.into_parts();
     let body = hyper::body::to_bytes(body).await.unwrap();
 
@@ -84,6 +94,27 @@ async fn lti(jar: SignedCookieJar, OriginalUri(original_uri): OriginalUri, req: 
     let mut params: Vec<(String, String)> = form_urlencoded::parse(&body).into_owned().collect();
     params.sort();
     tracing::debug!("{:?}", params);
+
+    // Check nonce value
+    let nonce: String = params
+        .iter()
+        .find(|(key, _)| key == "oauth_nonce")
+        .map(|(_, value)| value)
+        .unwrap()
+        .to_owned();
+    {
+        let mut used_nonce_values = used_nonce_values.lock().unwrap();
+        used_nonce_values.retain(|_, time| time.elapsed().as_secs() <= 90 * 60);
+        match used_nonce_values.get(&nonce) {
+            None => {
+                used_nonce_values.insert(nonce, Instant::now());
+            },
+            Some(_) => {
+                // Nonce value was reused
+                return Err(StatusCode::BAD_REQUEST);
+            },
+        }
+    }
 
     // Verify the signature
     let i = params.binary_search_by_key(&"oauth_signature", |(k, _)| k.as_str()).unwrap();
