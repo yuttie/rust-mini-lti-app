@@ -96,18 +96,14 @@ async fn lti(
     tracing::debug!("{:?}", params);
 
     // Check nonce value
-    let nonce: String = params
-        .iter()
-        .find(|(key, _)| key == "oauth_nonce")
-        .map(|(_, value)| value)
-        .unwrap()
-        .to_owned();
+    let i = params.binary_search_by_key(&"oauth_nonce", |(k, _)| k.as_str()).unwrap();
+    let nonce = params[i].1.as_str();
     {
         let mut used_nonce_values = used_nonce_values.lock().unwrap();
         used_nonce_values.retain(|_, time| time.elapsed().as_secs() <= 90 * 60);
-        match used_nonce_values.get(&nonce) {
+        match used_nonce_values.get(nonce) {
             None => {
-                used_nonce_values.insert(nonce, Instant::now());
+                used_nonce_values.insert(nonce.to_owned(), Instant::now());
             },
             Some(_) => {
                 // Nonce value was reused
