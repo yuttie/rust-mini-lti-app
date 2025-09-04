@@ -5,17 +5,65 @@ use std::time::Instant;
 use axum::{
     body::Body,
     Extension,
-    extract::OriginalUri,
+    extract::{OriginalUri, Query},
     http::{header, Method, Request, StatusCode, Uri},
+    response::Redirect,
     routing::{get, post},
     Router,
 };
 use axum_extra::extract::cookie::{SignedCookieJar, Cookie, Key};
 use hmac::{Hmac, Mac, digest::MacError};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation, errors::Error as JwtError};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+// LTI 1.3 Data Structures
+#[derive(Debug, Serialize, Deserialize)]
+struct LoginRequest {
+    iss: String,
+    login_hint: String,
+    target_link_uri: String,
+    client_id: Option<String>,
+    lti_deployment_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Lti13Claims {
+    iss: String,
+    sub: String,
+    aud: String,
+    exp: i64,
+    iat: i64,
+    nonce: String,
+    #[serde(rename = "https://purl.imsglobal.org/spec/lti/claim/message_type")]
+    message_type: String,
+    #[serde(rename = "https://purl.imsglobal.org/spec/lti/claim/version")]
+    version: String,
+    #[serde(rename = "https://purl.imsglobal.org/spec/lti/claim/deployment_id")]
+    deployment_id: String,
+    #[serde(rename = "https://purl.imsglobal.org/spec/lti/claim/target_link_uri")]
+    target_link_uri: String,
+    #[serde(rename = "https://purl.imsglobal.org/spec/lti/claim/resource_link")]
+    resource_link: Option<ResourceLink>,
+    #[serde(flatten)]
+    other: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ResourceLink {
+    id: String,
+    description: Option<String>,
+    title: Option<String>,
+}
+
+// Simple in-memory key store for demo purposes
+// In production, this would be loaded from configuration or a database
+
+type UsedNonceValues = Arc<Mutex<HashMap<String, Instant>>>;
+type Lti13UsedNonceValues = Arc<Mutex<HashMap<String, Instant>>>;
 
 #[tokio::main]
 async fn main() {
@@ -26,13 +74,17 @@ async fn main() {
 
     let key = Key::generate();
 
-    let used_nonce_values: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+    let used_nonce_values: UsedNonceValues = Arc::new(Mutex::new(HashMap::new()));
+    let lti13_used_nonce_values: Lti13UsedNonceValues = Arc::new(Mutex::new(HashMap::new()));
 
     let app = Router::new()
         .route("/", get(index))
-        .route("/lti", post(lti))
+        .route("/lti", post(lti))  // LTI 1.0/1.1 endpoint
+        .route("/lti13/login", get(lti13_login))  // LTI 1.3 OIDC login initiation
+        .route("/lti13/launch", post(lti13_launch))  // LTI 1.3 launch endpoint
         .layer(Extension(key))
         .layer(Extension(used_nonce_values))
+        .layer(Extension(lti13_used_nonce_values))
         .layer(TraceLayer::new_for_http());
 
     let app_path = std::env::var("APP_PATH").unwrap_or("/".into());
@@ -71,7 +123,7 @@ async fn index(jar: SignedCookieJar) -> Result<(SignedCookieJar, String), Status
 async fn lti(
     jar: SignedCookieJar,
     OriginalUri(original_uri): OriginalUri,
-    Extension(used_nonce_values): Extension<Arc<Mutex<HashMap<String, Instant>>>>,
+    Extension(used_nonce_values): Extension<UsedNonceValues>,
     req: Request<Body>,
 ) -> Result<(SignedCookieJar, String), StatusCode> {
     let (parts, body) = req.into_parts();
@@ -96,8 +148,11 @@ async fn lti(
     tracing::debug!("{:?}", params);
 
     // Check nonce value
-    let i = params.binary_search_by_key(&"oauth_nonce", |(k, _)| k.as_str()).unwrap();
-    let nonce = params[i].1.as_str();
+    let nonce_index = params.binary_search_by_key(&"oauth_nonce", |(k, _)| k.as_str());
+    let nonce = match nonce_index {
+        Ok(i) => params[i].1.as_str(),
+        Err(_) => return Err(StatusCode::BAD_REQUEST), // Missing oauth_nonce parameter
+    };
     {
         let mut used_nonce_values = used_nonce_values.lock().unwrap();
         used_nonce_values.retain(|_, time| time.elapsed().as_secs() <= 90 * 60);
@@ -113,8 +168,11 @@ async fn lti(
     }
 
     // Verify the signature
-    let i = params.binary_search_by_key(&"oauth_signature", |(k, _)| k.as_str()).unwrap();
-    let signature = params[i].1.as_str();
+    let signature_index = params.binary_search_by_key(&"oauth_signature", |(k, _)| k.as_str());
+    let signature = match signature_index {
+        Ok(i) => params[i].1.as_str(),
+        Err(_) => return Err(StatusCode::BAD_REQUEST), // Missing oauth_signature parameter
+    };
     let opt_params = match verify_signature(method, url, &params, "this_is_a_secret", signature) {
         Ok(_) => Some(params),
         _ => None,
@@ -124,10 +182,13 @@ async fn lti(
     match opt_params {
         Some(params) => {
             let params = params.into_iter().collect::<HashMap<_, _>>();
+            let name = params.get("lis_person_name_full")
+                .unwrap_or(&"LTI 1.0 User".to_string())
+                .to_owned();
             let jar = jar
-                .add(Cookie::new("name", params["lis_person_name_full"].to_owned()))
+                .add(Cookie::new("name", name))
                 .add(Cookie::new("count", "0"));
-            let body = format!("{:?}", jar);
+            let body = format!("LTI 1.0 Launch successful! User authenticated.");
             Ok((
                 jar,
                 body,
@@ -137,6 +198,143 @@ async fn lti(
             Err(StatusCode::UNAUTHORIZED)
         },
     }
+}
+
+// LTI 1.3 OIDC Login Initiation
+async fn lti13_login(
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Redirect, StatusCode> {
+    tracing::debug!("LTI 1.3 login initiation: {:?}", params);
+
+    // Extract required parameters
+    let iss = params.get("iss").ok_or(StatusCode::BAD_REQUEST)?;
+    let login_hint = params.get("login_hint").ok_or(StatusCode::BAD_REQUEST)?;
+    let target_link_uri = params.get("target_link_uri").ok_or(StatusCode::BAD_REQUEST)?;
+    let client_id = params.get("client_id");
+    let _lti_deployment_id = params.get("lti_deployment_id");
+
+    // Generate a nonce and state for OIDC flow
+    let nonce = format!("nonce_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+    let state = format!("state_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+
+    // Build OIDC authentication request
+    let mut auth_url = format!("{}/auth?", iss);
+    let auth_params = [
+        ("response_type", "id_token"),
+        ("client_id", client_id.map_or("rust-mini-lti-app", |v| v)),
+        ("redirect_uri", &format!("{}/lti13/launch", target_link_uri.split("/lti13/launch").next().unwrap_or("http://localhost:3000"))),
+        ("login_hint", login_hint),
+        ("state", &state),
+        ("response_mode", "form_post"),
+        ("nonce", &nonce),
+        ("prompt", "none"),
+    ];
+
+    let query_string = auth_params
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC)))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    auth_url.push_str(&query_string);
+
+    tracing::info!("Redirecting to: {}", auth_url);
+    Ok(Redirect::to(&auth_url))
+}
+
+// LTI 1.3 Launch Handler
+async fn lti13_launch(
+    jar: SignedCookieJar,
+    Extension(lti13_used_nonce_values): Extension<Lti13UsedNonceValues>,
+    req: Request<Body>,
+) -> Result<(SignedCookieJar, String), StatusCode> {
+    let (_parts, body) = req.into_parts();
+    let body = hyper::body::to_bytes(body).await.unwrap();
+
+    // Parse form data
+    let params: HashMap<String, String> = form_urlencoded::parse(&body)
+        .into_owned()
+        .collect();
+
+    tracing::debug!("LTI 1.3 launch parameters: {:?}", params);
+
+    // Get the ID token
+    let id_token = params.get("id_token").ok_or(StatusCode::BAD_REQUEST)?;
+    let state = params.get("state");
+
+    tracing::debug!("ID Token: {}", id_token);
+    tracing::debug!("State: {:?}", state);
+
+    // Verify JWT token (simplified - in production you'd verify signature properly)
+    match verify_lti13_token(id_token, &lti13_used_nonce_values) {
+        Ok(claims) => {
+            // Extract user information from claims
+            let name = claims.other.get("name")
+                .or_else(|| claims.other.get("given_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("LTI 1.3 User")
+                .to_string();
+
+            let jar = jar
+                .add(Cookie::new("name", name))
+                .add(Cookie::new("count", "0"));
+
+            let body = format!("LTI 1.3 Launch successful! User: {:?}, Deployment: {}", 
+                             claims.other.get("name").or(claims.other.get("given_name")), 
+                             claims.deployment_id);
+            
+            Ok((jar, body))
+        },
+        Err(e) => {
+            tracing::error!("JWT verification failed: {:?}", e);
+            Err(StatusCode::UNAUTHORIZED)
+        }
+    }
+}
+
+fn verify_lti13_token(
+    id_token: &str,
+    used_nonce_values: &Lti13UsedNonceValues,
+) -> Result<Lti13Claims, JwtError> {
+    // For a minimal implementation, we'll skip signature verification
+    // In production, you should verify the signature using the platform's public key
+    
+    // Decode without verification for demo purposes
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.insecure_disable_signature_validation();
+    validation.validate_exp = false; // Skip expiration check for demo
+
+    // Decode the token
+    let token_data = decode::<Lti13Claims>(
+        id_token,
+        &DecodingKey::from_secret(&[]), // Empty key since we're not verifying
+        &validation,
+    )?;
+
+    let claims = token_data.claims;
+
+    // Check nonce to prevent replay attacks
+    {
+        let mut nonce_values = used_nonce_values.lock().unwrap();
+        nonce_values.retain(|_, time| time.elapsed().as_secs() <= 90 * 60);
+        
+        if nonce_values.contains_key(&claims.nonce) {
+            return Err(JwtError::from(jsonwebtoken::errors::ErrorKind::InvalidToken));
+        }
+        nonce_values.insert(claims.nonce.clone(), Instant::now());
+    }
+
+    // Basic validation
+    if claims.message_type != "LtiResourceLinkRequest" {
+        return Err(JwtError::from(jsonwebtoken::errors::ErrorKind::InvalidToken));
+    }
+
+    if claims.version != "1.3.0" {
+        return Err(JwtError::from(jsonwebtoken::errors::ErrorKind::InvalidToken));
+    }
+
+    tracing::info!("LTI 1.3 token verified successfully");
+    Ok(claims)
 }
 
 fn verify_signature(
