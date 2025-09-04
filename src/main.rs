@@ -148,8 +148,11 @@ async fn lti(
     tracing::debug!("{:?}", params);
 
     // Check nonce value
-    let i = params.binary_search_by_key(&"oauth_nonce", |(k, _)| k.as_str()).unwrap();
-    let nonce = params[i].1.as_str();
+    let nonce_index = params.binary_search_by_key(&"oauth_nonce", |(k, _)| k.as_str());
+    let nonce = match nonce_index {
+        Ok(i) => params[i].1.as_str(),
+        Err(_) => return Err(StatusCode::BAD_REQUEST), // Missing oauth_nonce parameter
+    };
     {
         let mut used_nonce_values = used_nonce_values.lock().unwrap();
         used_nonce_values.retain(|_, time| time.elapsed().as_secs() <= 90 * 60);
@@ -165,8 +168,11 @@ async fn lti(
     }
 
     // Verify the signature
-    let i = params.binary_search_by_key(&"oauth_signature", |(k, _)| k.as_str()).unwrap();
-    let signature = params[i].1.as_str();
+    let signature_index = params.binary_search_by_key(&"oauth_signature", |(k, _)| k.as_str());
+    let signature = match signature_index {
+        Ok(i) => params[i].1.as_str(),
+        Err(_) => return Err(StatusCode::BAD_REQUEST), // Missing oauth_signature parameter
+    };
     let opt_params = match verify_signature(method, url, &params, "this_is_a_secret", signature) {
         Ok(_) => Some(params),
         _ => None,
@@ -176,10 +182,13 @@ async fn lti(
     match opt_params {
         Some(params) => {
             let params = params.into_iter().collect::<HashMap<_, _>>();
+            let name = params.get("lis_person_name_full")
+                .unwrap_or(&"LTI 1.0 User".to_string())
+                .to_owned();
             let jar = jar
-                .add(Cookie::new("name", params["lis_person_name_full"].to_owned()))
+                .add(Cookie::new("name", name))
                 .add(Cookie::new("count", "0"));
-            let body = format!("{:?}", jar);
+            let body = format!("LTI 1.0 Launch successful! User authenticated.");
             Ok((
                 jar,
                 body,
